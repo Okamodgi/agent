@@ -1,0 +1,141 @@
+import asyncio
+import random
+import requests
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+TELEGRAM_TOKEN = ""  #  СВОЙ ТОКЕН
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_KEY = ""  # СВОЙ КЛЮЧ
+MODEL = "openrouter/free"
+
+SYSTEM_PROMPT = """Ты — мой напарник-детектив в реалистичном расследовании. Мы работаем вместе: я принимаю все решения, а ты раскрываешь мир вокруг меня, как будто мы реально стоим на месте преступления.
+Правила:
+- ответы должны быть короткие, будто мы ведём диалог
+- Никогда не предлагай варианты действий, не делай нумерованные списки и не пиши «вы можете…». Пусть я сама решу, что делать.
+- На каждое моё действие отвечай как живой человек: короткими, ёмкими абзацами. Используй детали через 5 чувств: звуки, запахи, холод металла, капли дождя, скрип половиц.
+- Если я делаю что-то нестандартное — не блокируй и не говори «это невозможно». Наоборот, органично впиши это в сцену и покажи последствия.
+- Держи напряжение: иногда улики ведут в тупик, иногда свидетели врут, иногда ничего не происходит — это тоже часть работы детектива.
+- Не раскрывай развязку и не делай сюжетных выводов за меня. Не говори «это явно сделал он» или «вот ключ к разгадке».
+- Тон: реалистичный, без штампов про «злодей хохочет в темноте». Пусть всё выглядит как обычная, но напряжённая работа сыщика.
+- В конце ответа не давай никаких выводов, итогов или подталкиваний к действию. Просто оставь сцену «висящей» — чтобы я сама решила, куда идти дальше.
+"""
+
+MAX_MESSAGE_LENGTH = 4000
+
+# Хранилище истории и состояний (в памяти)
+chat_history = {}
+state = {}
+
+
+def ask_ai(peer_id: int, user_text: str) -> str:
+    """Обращение к OpenRouter с историей диалога."""
+    history = chat_history.setdefault(peer_id, [])
+    history.append({"role": "user", "content": user_text})
+
+    try:
+        response = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    *history,
+                ],
+            },
+            timeout=60,
+        )
+        data = response.json()
+    except requests.RequestException as e:
+        history.pop()
+        return f"Ошибка соединения: {e}"
+
+    if response.status_code != 200 or "choices" not in data or len(data["choices"]) == 0:
+        history.pop()
+        error_msg = data.get("error", {})
+        if isinstance(error_msg, dict):
+            msg = error_msg.get("message", "ошибка")
+        else:
+            msg = str(error_msg) if error_msg else "ошибка"
+        return f"ошибка: {msg}"
+
+    try:
+        answer = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        history.pop()
+        return "ошибка при разборе ответа от ИИ"
+
+    if not answer:
+        history.pop()
+        return "пустой ответ от ИИ"
+
+    history.append({"role": "assistant", "content": answer})
+    # Храним последние 10 сообщений на диалог, чтобы не раздувать память
+    if len(history) > 10:
+        chat_history[peer_id] = history[-10:]
+
+    return answer
+
+
+def reset_dialog(peer_id: int) -> None:
+    chat_history.pop(peer_id, None)
+    state.pop(peer_id, None)
+
+
+async def send_long_message(update: Update, text: str) -> None:
+    """Разбивает длинное сообщение на части и отправляет по очереди."""
+    if not text:
+        return
+
+    for i in range(0, len(text), MAX_MESSAGE_LENGTH):
+        chunk = text[i:i + MAX_MESSAGE_LENGTH]
+        await update.message.reply_text(chunk)
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Привет! Я твой напарник‑детектив. Расскажи, с чего начнём расследование."
+    )
+    reset_dialog(update.effective_chat.id)
+
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    reset_dialog(update.effective_chat.id)
+    await update.message.reply_text("Диалог сброшен. Начинаем заново.")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    peer_id = update.effective_chat.id
+
+    # Если есть спецкоманда /reset — обрабатываем отдельно
+    if text.lower().startswith("/reset"):
+        reset_dialog(peer_id)
+        await update.message.reply_text("Диалог сброшен.")
+        return
+
+    await update.message.chat.send_action(action="typing")
+    ai_response = ask_ai(peer_id, text)
+    await send_long_message(update, ai_response)
+
+
+def main() -> None:
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("reset", reset_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("Бот запущен. Ожидаю сообщения...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
